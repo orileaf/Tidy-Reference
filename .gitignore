@@ -1,0 +1,58 @@
+# Python
+**/__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local MCP / editor config (may contain hardcoded paths)
+.mcp.json
+.mcpong/
+
+# Claude Code internal (settings, memory, plans)
+.claude/
+
+# Environment and secrets
+.env
+config.env
+
+# Data outputs (generated at runtime)
+data/01_raw/
+data/02_llm/
+data/03_search/
+data/04_quality/
+data/05_export/
+data/qa_*.json
+data/refs_raw.json
+data/llm_results.json
+data/search_results.json
+data/qa_results.json
+data/qa_review.json
+data/qa_approved.json
+data/qa_medium.json
+data/qa_low.json
+data/stage3_warnings_report.md
+data/qa_review_report.md
+
+# Input files (your documents — keep local)
+1.docx
+*.docx
+*.txt
+lookup_results copy.json

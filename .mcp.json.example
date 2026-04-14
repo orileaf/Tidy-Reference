@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "MiniMax": {
+      "command": "bash",
+      "args": [
+        "-c",
+        "cd /path/to/your/tidy-reference && source config.env && exec uvx minimax-coding-plan-mcp -y -"
+      ]
+    }
+  }
+}
