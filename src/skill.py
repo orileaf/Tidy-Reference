@@ -71,6 +71,12 @@ def cmd_review(args):
         extra.append("--approve")
     elif args.review:
         extra.append("--review")
+    elif args.manual:
+        extra.append("--manual")
+    elif args.manual_review:
+        extra.append("--manual-review")
+    elif args.manual_approve:
+        extra.append("--manual-approve")
     _run_module("quality", extra)
 
 
@@ -135,6 +141,12 @@ def main():
                           help="Merge approved entries → qa_approved.json")
     p_review.add_argument("--review", action="store_true",
                           help="Interactive review (resumable; run after 'review' without flags)")
+    p_review.add_argument("--manual", action="store_true",
+                          help="Parse manual_research.json + run LLM QA → manual_review.json")
+    p_review.add_argument("--manual-review", action="store_true",
+                          help="Interactive review of manual_review.json entries")
+    p_review.add_argument("--manual-approve", action="store_true",
+                          help="Merge approved manual entries into qa_approved.json")
     p_review.set_defaults(func=cmd_review)
 
     # ── export ────────────────────────────────────────────────────────────────

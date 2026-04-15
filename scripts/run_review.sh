@@ -2,14 +2,18 @@
 # scripts/run_review.sh — QA judgment + interactive review workflow
 #
 # Usage:
-#   ./run_review.sh               run QA judgment (only — safe to re-run)
-#   ./run_review.sh --review      interactive review (resumable, enter any time)
-#   ./run_review.sh --approve     merge approved entries → bib_export_report.md
+#   ./run_review.sh                    run QA judgment (only — safe to re-run)
+#   ./run_review.sh --review           interactive review (resumable)
+#   ./run_review.sh --approve          merge approved entries → bib_export_report.md
+#   ./run_review.sh --manual           manual search: parse research_text → LLM → update qa_review.json
 #
 # Full workflow:
-#   ./run_review.sh               # QA classification → qa_review.json
-#   ./run_review.sh --review      # interactive review (can exit + re-enter)
-#   ./run_review.sh --approve     # merge + generate report
+#   ./run_review.sh                   QA classification → qa_review.json
+#   ./run_review.sh --review          interactive review
+#                                    (auto-run --approve + reset manual_research.json when done)
+#   # fill in manual_research.json research_text for skipped entries
+#   ./run_review.sh --manual          parse research_text → LLM → QA → update qa_review.json
+#   ./run_review.sh --review          review medium/low entries with manual_data
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -29,6 +33,9 @@ case "${1:-}" in
         ;;
     --approve)
         $PYTHON -m src.modules.quality --approve
+        ;;
+    --manual)
+        $PYTHON -m src.modules.quality --manual
         ;;
     *)
         $PYTHON -m src.modules.quality

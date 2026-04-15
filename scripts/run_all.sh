@@ -4,14 +4,17 @@
 #
 # Full workflow:
 #   ./run_all.sh                  parse → llm → search → QA judgment (pauses)
-#   ./run_review.sh --review       interactive review (can exit + resume)
-#   ./run_review.sh --approve      merge approved → bib_export_report.md
-#   ./run_export.sh               export bibliography
+#   ./run_review.sh --review      interactive review
+#                                    (auto: --approve + reset manual_research.json when done)
+#   # fill in manual_research.json for skipped entries, then:
+#   ./run_review.sh --manual      parse research_text → LLM → QA → update qa_review.json
+#   ./run_review.sh --review      review remaining medium/low entries
+#   ./run_export.sh              export bibliography
 #
 # Or use the skill CLI directly:
 #   python -m src.skill run
 #   python -m src.skill review --review
-#   python -m src.skill review --approve
+#   python -m src.skill review --manual
 #   python -m src.skill export
 
 set -e
@@ -43,6 +46,7 @@ echo " Pipeline paused — QA judgment complete."
 echo ""
 echo " Next steps:"
 echo "   ./run_review.sh --review   # interactive review"
-echo "   ./run_review.sh --approve  # merge + generate report"
+echo "   # fill in manual_research.json for skipped entries"
+echo "   ./run_review.sh --manual  # parse research_text → LLM → QA"
 echo "   ./run_export.sh           # export bibliography"
 echo "═══════════════════════════════════════════════════════"

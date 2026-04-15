@@ -19,8 +19,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-import python_docx_path  # noqa: F401 — may be needed if python-docx is not in default site-packages
-
 
 # ── Reference header detection ─────────────────────────────────────────────────
 
@@ -29,6 +27,10 @@ REF_HEADER_PATTERNS = [
     (r"^(\d+)\.\s+(.)", "N. header"),
     (r"^(\d+)\s+([A-Z])", "bare N  header"),
 ]
+
+# Pattern that matches a [N] reference marker embedded anywhere in text (used
+# for splitting single-paragraph reference lists).
+_EMBEDDED_REF_PATTERN = re.compile(r"\s(\[(?:\d+)\])\s")
 
 
 def is_ref_header(text: str):
@@ -45,8 +47,51 @@ def strip_ref_header(text: str):
     """Remove reference number prefix from the first line of a reference."""
     text = re.sub(r"^\[\d+\](?:\.\s*|\s+)", "", text)
     text = re.sub(r"^\d+\.\s+", "", text)
-    text = re.sub(r"^\d+\s+", "", text)
+    text = re.sub(r"^\d+\s+", "", text)  # bare N header
     return text
+
+
+def split_embedded_refs(para: str) -> list[dict]:
+    """Split a paragraph that contains multiple [N] references into separate entries.
+
+    Handles the pattern: '[1] text [2] text ... [N] text' where all refs land in
+    a single paragraph or line.  Splits on ' [N] ' boundaries and returns a list
+    of {"ref_id": int, "raw_text": str} dicts.
+    """
+    # Split on ' [N] ' boundaries.
+    parts = _EMBEDDED_REF_PATTERN.split(para)
+    refs = []
+
+    idx = 0
+    # The first split part may start with '[N]' directly (no leading space).
+    if idx < len(parts) and re.match(r"^\[\d+\]", parts[idx]):
+        m = re.match(r"^\[(\d+)\](?:(?:\.\s+|\s+)(.+))?$", parts[idx])
+        if m:
+            refs.append({"ref_id": int(m.group(1)), "raw_text": (m.group(2) or "").strip()})
+        idx += 1
+
+    # Remaining parts alternate: header token ('[N]') → content text → ...
+    while idx < len(parts):
+        header = parts[idx]
+        idx += 1
+        if idx >= len(parts):
+            break
+        content = parts[idx].strip()
+        idx += 1
+
+        # Match both bare '[N]' (header token) and '[N] content' (direct call).
+        m = re.match(r"^\[(\d+)\](?:(?:\.\s+|\s+)(.+))?$", header)
+        if m:
+            ref_id = int(m.group(1))
+            # If header had no content, use the split-off content; otherwise header
+            # content takes priority (handles the direct-call case).
+            raw = (m.group(2) or content) if not m.group(2) else m.group(2)
+            refs.append({"ref_id": ref_id, "raw_text": raw.strip()})
+        elif refs and content:
+            # No new header — content is a continuation of the previous ref.
+            refs[-1]["raw_text"] += " " + content
+
+    return refs
 
 
 # ── Document parsing ────────────────────────────────────────────────────────────
@@ -89,6 +134,14 @@ def _extract_from_paragraphs(raw_paras: list[str]) -> list[dict]:
 
     while i < len(raw_paras):
         para = raw_paras[i]
+
+        # Check for embedded [N] markers first — handles the case where all
+        # references land in a single paragraph/line (e.g. '[1] ... [2] ...').
+        if re.search(r"\s\[\d+\]\s", para):
+            refs.extend(split_embedded_refs(para))
+            i += 1
+            continue
+
         ref_id = is_ref_header(para)
         if ref_id is None:
             i += 1

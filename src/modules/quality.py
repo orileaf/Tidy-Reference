@@ -26,6 +26,7 @@ Workflow:
 import json
 import os
 import re
+import shutil
 import sys
 import tty
 import termios
@@ -37,6 +38,37 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from src.config import get
 from src.utils.llm_client import get_llm_response
+
+# ── Terminal sizing ─────────────────────────────────────────────────────────────
+
+TERMINAL_WIDTH = shutil.get_terminal_size().columns if sys.stdout.isatty() else 120
+LABEL_W = 8   # width reserved for field label column
+CELL_GAP = 4  # spaces between columns
+NUM_COLS = 4  # LLM, CR, S2, MCP
+COL_W = max(20, (TERMINAL_WIDTH - 2 - LABEL_W - CELL_GAP * (NUM_COLS + 1)) // NUM_COLS)
+
+
+def _wrap(text: str, width: int) -> list[str]:
+    """Wrap text into lines of at most `width` chars at word boundaries."""
+    if not text:
+        return [""]
+    lines = []
+    for paragraph in text.split("\n"):
+        while paragraph:
+            if len(paragraph) <= width:
+                lines.append(paragraph)
+                break
+            # Find last space within width
+            cut = paragraph[:width]
+            last_space = cut.rfind(" ")
+            if last_space > width // 2:
+                lines.append(cut[:last_space])
+                paragraph = paragraph[last_space + 1:]
+            else:
+                lines.append(cut)
+                paragraph = paragraph[width:]
+    return lines if lines else [""]
+
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
@@ -53,6 +85,8 @@ QA_REVIEW       = STAGE_QUAL   / "qa_review.json"
 QA_REVIEW_BAK   = STAGE_QUAL   / "qa_review.json.bak"
 QA_APPROVED     = STAGE_QUAL   / "qa_approved.json"
 BIB_REPORT      = STAGE_EXP    / "bib_export_report.md"
+MANUAL_RESEARCH_JSON = STAGE_QUAL / "manual_research.json"
+MANUAL_REVIEW_JSON  = STAGE_QUAL / "manual_review.json"
 
 # Legacy paths (read-only migration)
 QA_MEDIUM_JSON = DATA / "qa_medium.json"
@@ -234,11 +268,12 @@ def _build_review_data(search_results: list) -> dict:
         # Strip private fields from the source entry
         entry_copy = {k: v for k, v in e.items() if not k.startswith("_")}
         review_entries[rid] = {
-            "_approved": None,
+            "_approved": False,
             "_reviewed_at": None,
             "_review_note": None,
             "_patch": None,
             "_decision": "pending",
+            "_source": "auto_search",
             **entry_copy,
         }
 
@@ -285,6 +320,7 @@ def _migrate_legacy_review_files() -> dict | None:
                     "_review_note": f"(migrated from legacy {label} file; decision: {decision})",
                     "_patch": None,
                     "_decision": decision,
+                    "_source": "auto_search",
                     **{k: v for k, v in e.items() if not k.startswith("_")},
                 }
 
@@ -684,34 +720,44 @@ def run_approve():
     with open(QA_RESULTS_JSON, encoding="utf-8") as f:
         all_results = json.load(f)
 
-    result_map = {int(r["ref_id"]): r for r in all_results}
     review_entries = review_data["entries"]
 
-    # Build approved list
+    # Build approved list from two sources: qa_results.json (base) + qa_review.json (overrides).
+    # qa_review.json has higher priority for any overlapping ref_ids.
+    approved_rids: set[int] = set()
     approved = []
-    for rid_str, entry in review_entries.items():
-        if entry.get("_approved") is not True:
-            continue
-        rid = int(rid_str)
-        base = dict(result_map.get(rid, {}))
-        base["qa"] = entry.get("qa", base.get("qa", {}))
-        base["_approved_via"] = entry["qa"].get("confidence", "medium")
-        patch = entry.get("_patch")
-        if patch:
-            base["_patch"] = patch
-        base["_review_note"] = entry.get("_review_note", "")
-        base["_decision"] = entry.get("_decision", "approved")
-        approved.append(base)
 
-    # High-confidence auto-include
-    high_entries = []
+    # Start from qa_results.json as the base
     for r in all_results:
-        if r["qa"].get("confidence") == "high":
-            base = dict(r)
+        rid = int(r["ref_id"])
+        reviewed_entry = review_entries.get(str(rid), {})
+        # Skip if not approved in qa_review.json and not high-confidence in qa_results.json
+        if reviewed_entry.get("_approved") is not True and r["qa"].get("confidence") != "high":
+            continue
+        base = dict(r)
+        # Override with qa_review.json entry if it exists
+        if reviewed_entry:
+            base.update({
+                k: v for k, v in reviewed_entry.items()
+                if k not in ("crossref", "semantic_scholar", "mcp", "llm_data", "strategy_used")
+            })
+            # qa from qa_review.json overrides qa_results.json (contains latest manual QA)
+            if "qa" in reviewed_entry:
+                base["qa"] = reviewed_entry["qa"]
+        # Determine _approved_via label
+        if reviewed_entry and reviewed_entry.get("manual_data") is not None:
+            base["_source"] = "manual_search"
+            conf = base.get("qa", {}).get("confidence", "medium")
+            base["_approved_via"] = "manual_high" if conf == "high" else f"manual_{conf}"
+        elif reviewed_entry and reviewed_entry.get("_approved") is True:
+            base["_source"] = "manual_review"
+            base["_approved_via"] = base.get("qa", {}).get("confidence", "medium")
+        else:
             base["_approved_via"] = "high"
             base["_decision"] = "auto"
-            approved.append(base)
-            high_entries.append(base)
+            base["_source"] = "auto_search"
+        approved_rids.add(rid)
+        approved.append(base)
 
     approved.sort(key=lambda x: int(x["ref_id"]))
     _save_json(approved, QA_APPROVED)
@@ -719,7 +765,7 @@ def run_approve():
     # Generate merged report
     _generate_export_report(all_results, review_entries, approved)
 
-    high_count   = len(high_entries)
+    high_count   = sum(1 for e in approved if e.get("_approved_via") == "high")
     med_approved  = sum(1 for e in review_entries.values()
                         if e.get("_approved") is True and e["qa"].get("confidence") == "medium")
     low_approved  = sum(1 for e in review_entries.values()
@@ -810,38 +856,74 @@ else:
 def _c(s, col):
     return f"{_CC[col]}{s}{_CC['x']}" if _CC[col] else s
 
+
 def _t(s, n=38):
-    return (s[:n] + "…") if len(s) > n else (s or "")
+    """Truncate at word boundary, add ellipsis."""
+    if not s:
+        return ""
+    if len(s) <= n:
+        return s
+    cut = s[:n]
+    last_space = cut.rfind(" ")
+    if last_space > n // 2:
+        return cut[:last_space] + "…"
+    return cut + "…"
+
 
 def _print_field_table(llm, cr, s2, mcp, agreed, disagreed):
     FIELDS = [("title","Title"),("authors","Authors"),
               ("journal","Journal"),("year","Year"),
               ("volume","Vol"),("pages","Pages"),("doi","DOI")]
-    sep = "  " + _c("─"*74, "d")
+    sep = "  " + _c("─" * (LABEL_W + CELL_GAP + COL_W * NUM_COLS + CELL_GAP * 2), "d")
     print(sep)
-    print(f"  {_c('Field','d'):<8}  {_c('LLM','b'):<38}  "
-          f"{_c('CR','g'):<38}  {_c('S2','y'):<38}  {_c('MCP','c'):<38}")
+    headers = "  " + f"{_c('Field', 'd'):<{LABEL_W}}" + " " * CELL_GAP + \
+              "  ".join(f"{_c(src.upper(), color):<{COL_W}}"
+                        for src, color in [("LLM","b"),("CR","g"),("S2","y"),("MCP","c")])
+    print(headers)
     print(sep)
+
     any_row = False
     for fk, fl in FIELDS:
-        lv = (llm.get(fk) or ""); cv = (cr.get(fk) or "")
-        sv = (s2.get(fk) or "");   mv = (mcp.get(fk) or "")
+        lv = llm.get(fk) or ""; cv = cr.get(fk) or ""
+        sv = s2.get(fk) or "";   mv = mcp.get(fk) or ""
         if not (lv or cv or sv or mv):
             continue
         any_row = True
+
+        l_lines = _wrap(lv, COL_W)
+        c_lines = _wrap(cv, COL_W)
+        s_lines = _wrap(sv, COL_W)
+        m_lines = _wrap(mv, COL_W)
+        max_lines = max(len(l_lines), len(c_lines), len(s_lines), len(m_lines))
+
         col = "r" if fk in disagreed else ("g" if fk in agreed else "")
-        def _cell(v, cc):
-            if not v: return _c("—", "d")
-            return _c(_t(v), cc)
-        lbl = _c(f"{fl:<8}", col or "d")
-        print(f"  {lbl}  {_cell(lv,'b'):<38}  {_cell(cv,'g'):<38}  "
-              f"{_cell(sv,'y'):<38}  {_cell(mv,'c'):<38}")
+
+        for i in range(max_lines):
+            lc = l_lines[i] if i < len(l_lines) else ""
+            cc = c_lines[i] if i < len(c_lines) else ""
+            sc = s_lines[i] if i < len(s_lines) else ""
+            mc = m_lines[i] if i < len(m_lines) else ""
+
+            def _cell(v, cc):
+                return _c(v, cc) if v else _c("—", "d")
+            row_lbl = (f"{_c(fl + ':', col or 'd'):<{LABEL_W}}") if i == 0 else " " * LABEL_W
+            print(f"  {row_lbl}  {_cell(lc, col or 'b'):<{COL_W}}  "
+                  f"{_cell(cc, col or 'g'):<{COL_W}}  "
+                  f"{_cell(sc, col or 'y'):<{COL_W}}  "
+                  f"{_cell(mc, col or 'c'):<{COL_W}}")
+
     if not any_row:
         print(f"  {_c('  (no structured fields)', 'd')}")
+    print(sep)
 
 
 def _display_card(rid, entry, idx, total, raw_map, meta):
     """Print one entry card for review."""
+    # If manual_data is present, show raw vs manual comparison instead of 4-channel table
+    if entry.get("manual_data"):
+        _print_manual_card(rid, entry, raw_map, meta)
+        return
+
     qa        = entry.get("qa", {})
     conf      = qa.get("confidence", "?")
     strategy  = entry.get("strategy_used", "")
@@ -859,12 +941,13 @@ def _display_card(rid, entry, idx, total, raw_map, meta):
     agreed    = qa.get("agreed_fields", [])
     disagreed = qa.get("disagreed_fields", [])
     rid_int   = int(rid)
-    raw_text  = (raw_map.get(rid_int, {}).get("raw_text", "") or "")[:110]
-    reason    = qa.get("reason", "")[:140]
+    raw_text  = raw_map.get(rid_int, {}).get("raw_text", "") or ""
+    reason    = qa.get("reason", "") or ""
     patch     = entry.get("_patch")
     decision  = entry.get("_decision", "pending")
 
-    sep = _c("─" * 72, "d")
+    CARD_W = TERMINAL_WIDTH - 4
+    sep = _c("─" * CARD_W, "d")
     # ── Header ────────────────────────────────────────────────────────────────
     print(f"\n{sep}")
     print(f"  {_c(f'ref #{rid_int}', 'B')}  {_c(badge_txt, badge_col)}  "
@@ -872,22 +955,29 @@ def _display_card(rid, entry, idx, total, raw_map, meta):
     # Progress bar
     done  = meta["reviewed_count"]
     skip  = meta["skipped_count"]
-    bw    = 44
+    bw    = max(20, CARD_W - 20)
     bar   = _c("█" * int(done / total * bw if total else 0), "g") + \
             _c("░" * max(0, bw - int(done / total * bw if total else 0)), "d")
     print(f"  [{bar}]  {_c('✅' + str(done), 'g')}  "
           f"{_c('⏸' + str(skip), 'd')}  "
           f"{_c('⏳' + str(total - done), 'y')}")
 
-    # ── Raw citation ───────────────────────────────────────────────────────────
-    print(f"  {_c('RAW', 'd')}: {raw_text}")
+    # ── Raw citation (word-wrapped) ───────────────────────────────────────────
+    RAW_W = TERMINAL_WIDTH - 10
+    raw_lines = _wrap(raw_text, RAW_W)
+    for i, line in enumerate(raw_lines):
+        prefix = f"  {_c('RAW', 'd')}: " if i == 0 else "  " + " " * 7 + " "
+        print(prefix + line)
 
     # ── Field table ────────────────────────────────────────────────────────────
     _print_field_table(llm, cr, s2, mcp, agreed, disagreed)
 
-    # ── LLM reason ─────────────────────────────────────────────────────────────
+    # ── LLM reason (word-wrapped) ─────────────────────────────────────────────
     if reason:
-        print(f"\n  {_c('LLM: ', 'd')}{_t(reason, 120)}")
+        reason_lines = _wrap(reason, RAW_W)
+        for i, line in enumerate(reason_lines):
+            prefix = f"  {_c('LLM: ', 'd')}" if i == 0 else "  " + " " * 7 + " "
+            print(prefix + line)
 
     # ── Disagreements ─────────────────────────────────────────────────────────
     if disagreed:
@@ -900,6 +990,80 @@ def _display_card(rid, entry, idx, total, raw_map, meta):
 
     print(sep)
     # ── Commands ────────────────────────────────────────────────────────────────
+    print(f"  [{_c('A', 'g')}]pprove  [{_c('S', 'r')}kip  "
+          f"[{_c('E', 'y')}dit/patch  [{_c('P', 'b')}##-##  "
+          f"[{_c('D', 'd')}one/skip-all  [{_c('Q', 'd')}uit")
+    print(f"  {_c('> ', 'd')}", end="", flush=True)
+
+
+def _print_manual_card(rid, entry, raw_map, meta):
+    """Print a card comparing raw citation vs manual_data (no CR/S2/MCP channels)."""
+    rid_int = int(rid)
+    raw_text = raw_map.get(rid_int, {}).get("raw_text", "") or ""
+    manual = entry.get("manual_data") or {}
+    qa = entry.get("qa", {})
+    conf = qa.get("confidence", "?")
+    badge_txt = "✅ high" if conf == "high" else f"⚠ {conf}"
+    badge_col = "g" if conf == "high" else "y"
+
+    CARD_W = TERMINAL_WIDTH - 4
+    sep = _c("─" * CARD_W, "d")
+
+    def _fmt(d: dict) -> str:
+        if not d:
+            return "—"
+        parts = [f"{k}={d.get(k,'')}" for k in ["title", "authors", "journal", "year", "volume", "pages", "doi"]
+                 if d.get(k)]
+        return ", ".join(parts) or "—"
+
+    done  = meta["reviewed_count"]
+    skip  = meta["skipped_count"]
+    bw    = max(20, CARD_W - 20)
+    bar   = _c("█" * int(done / meta.get("total", 1) * bw if meta.get("total") else 0), "g") + \
+            _c("░" * max(0, bw - int(done / meta.get("total", 1) * bw if meta.get("total") else 0)), "d")
+
+    RAW_W = TERMINAL_WIDTH - 10
+
+    # ── Header ────────────────────────────────────────────────────────────────
+    print(f"\n{sep}")
+    print(f"  {_c(f'ref #{rid_int}', 'B')}  {_c(badge_txt, badge_col)}  |  manual_data")
+    print(f"  [{bar}]  {_c('✅' + str(done), 'g')}  "
+          f"{_c('⏸' + str(skip), 'd')}  "
+          f"{_c('⏳' + str(meta.get('total', 1) - done), 'y')}")
+    print(sep)
+
+    # ── RAW ──────────────────────────────────────────────────────────────────
+    raw_lines = _wrap(raw_text, RAW_W)
+    for i, line in enumerate(raw_lines):
+        prefix = f"  {_c('RAW', 'd')}: " if i == 0 else "  " + " " * 7 + " "
+        print(prefix + line)
+
+    # ── Manual data fields ────────────────────────────────────────────────────
+    manual_lines = _wrap(_fmt(manual), RAW_W)
+    for i, line in enumerate(manual_lines):
+        prefix = f"  {_c('MANUAL', 'g')}: " if i == 0 else "  " + " " * 8 + " "
+        print(prefix + line)
+
+    # ── LLM reason ─────────────────────────────────────────────────────────────
+    reason = qa.get("reason", "") or ""
+    if reason:
+        reason_lines = _wrap(reason, RAW_W)
+        for i, line in enumerate(reason_lines):
+            prefix = f"  {_c('LLM: ', 'd')}" if i == 0 else "  " + " " * 7 + " "
+            print(prefix + line)
+
+    # ── Disagreements ─────────────────────────────────────────────────────────
+    disagreed = qa.get("disagreed_fields", [])
+    if disagreed:
+        print(f"  {_c('⚔ disagree: ', 'r')}{', '.join(disagreed)}")
+
+    # ── Patch ──────────────────────────────────────────────────────────────────
+    patch = entry.get("_patch")
+    if patch:
+        items = "  ".join(f"{k}={v}" for k, v in patch.items())
+        print(f"  {_c('🔧 patch: ', 'y')}{items}")
+
+    print(sep)
     print(f"  [{_c('A', 'g')}]pprove  [{_c('S', 'r')}kip  "
           f"[{_c('E', 'y')}dit/patch  [{_c('P', 'b')}##-##  "
           f"[{_c('D', 'd')}one/skip-all  [{_c('Q', 'd')}uit")
@@ -920,10 +1084,10 @@ def run_review():
     meta = review_data["_meta"]
 
     pending = sorted(
-        [rid for rid, e in entries.items() if e["_decision"] == "pending"],
+        [rid for rid, e in entries.items() if e["_approved"] is False],
         key=int
     )
-    already_reviewed = sum(1 for e in entries.values() if e["_decision"] != "pending")
+    already_reviewed = sum(1 for e in entries.values() if e["_approved"] is not False)
 
     print(f"\n══ Interactive Review: {len(pending)} entries to review "
           f"({already_reviewed} already reviewed) ══")
@@ -956,7 +1120,7 @@ def run_review():
             entries = review_data["entries"]
             # Re-sort pending (current was just reviewed)
             pending = sorted(
-                [r for r, e in entries.items() if e["_decision"] == "pending"],
+                [r for r, e in entries.items() if e["_approved"] is False],
                 key=int
             )
             continue
@@ -980,20 +1144,20 @@ def run_review():
             line = sys.stdin.readline().strip()
             ids = _parse_approve_range(line, pending)
             for target_rid in ids:
-                if target_rid in entries and entries[target_rid]["_decision"] == "pending":
+                if target_rid in entries and entries[target_rid]["_approved"] is False:
                     _decide(review_data, target_rid, True)
                     with open(QA_REVIEW, encoding="utf-8") as f:
                         review_data = json.load(f)
                     entries = review_data["entries"]
             pending = sorted(
-                [r for r, e in entries.items() if e["_decision"] == "pending"],
+                [r for r, e in entries.items() if e["_approved"] is False],
                 key=int
             )
             continue
         elif key == "d":
             # Skip all remaining
             for r in pending[idx:]:
-                if entries[r]["_decision"] == "pending":
+                if entries[r]["_approved"] is False:
                     _decide(review_data, r, False)
             break
         elif key == "q":
@@ -1016,14 +1180,478 @@ def run_review():
     print(f"  Approved:  {final_meta['approved_count']}")
     print(f"  Skipped:   {final_meta['skipped_count']}")
 
-    if final_meta["reviewed_count"] == final_meta["total"]:
+    # Always call run_approve() after review — it rebuilds qa_approved.json from current qa_review.json
+    # _approved=True entries (approved by user or auto-approved by --manual) are included,
+    # _approved=False entries are excluded. Safe to call even if review was partial or full.
+    print()
+    print("  Generating qa_approved.json from current qa_review.json...")
+    print()
+    run_approve()
+    _reset_manual_research_json()
+
+
+# ── Manual Research Workflow ───────────────────────────────────────────────────
+
+def _load_raw_map() -> dict:
+    """Load raw citation text keyed by ref_id int."""
+    raw_map = {}
+    if REFS_RAW.exists():
+        with open(REFS_RAW, encoding="utf-8") as f:
+            for e in json.load(f):
+                raw_map[int(e["ref_id"])] = e
+    return raw_map
+
+
+def _reset_manual_research_json():
+    """将 qa_review.json 中 _approved == False 的条目写入 manual_research.json，
+    research_text 强制置为 'null'，parsed 置为 None。"""
+    if not QA_REVIEW.exists():
+        return
+    with open(QA_REVIEW, encoding="utf-8") as f:
+        review = json.load(f)
+
+    entries_out = {}
+    for rid_str, entry in review.get("entries", {}).items():
+        if entry.get("_approved") is False:
+            rid = int(rid_str)
+            raw_text = _read_raw_map().get(rid, {}).get("raw_text", "")
+            entries_out[rid_str] = {
+                "ref_id": rid,
+                "research_text": "null",
+                "parsed": None,
+            }
+
+    data = {
+        "_meta": {
+            "updated_at": datetime.now().isoformat(),
+            "total": len(entries_out),
+            "source": "reset_from_qa_review",
+        },
+        "entries": entries_out,
+    }
+    _save_json(data, MANUAL_RESEARCH_JSON)
+    count = len(entries_out)
+    print(f"  manual_research.json 重置 → {MANUAL_RESEARCH_JSON}（{count} 条待手动搜索）")
+
+
+def _init_manual_research_json():
+    """
+    Initialize manual_research.json with all ref_ids that are pending or skipped
+    in qa_review.json. If the file already exists, preserve its research_text values.
+    """
+    pending_ids: set[int] = set()
+    existing_research: dict[str, str | None] = {}
+
+    if QA_REVIEW.exists():
+        with open(QA_REVIEW, encoding="utf-8") as f:
+            review = json.load(f)
+        for rid, entry in review.get("entries", {}).items():
+            if entry.get("_approved") is False:
+                pending_ids.add(int(rid))
+
+    if MANUAL_RESEARCH_JSON.exists():
+        with open(MANUAL_RESEARCH_JSON, encoding="utf-8") as f:
+            existing = json.load(f)
+        for rid, entry in existing.get("entries", {}).items():
+            existing_research[rid] = entry.get("research_text")
+
+    if not pending_ids:
+        print("  No pending/skipped entries to research.")
+        return
+
+    entries = {}
+    for rid in sorted(pending_ids):
+        rid_str = str(rid)
+        entries[rid_str] = {
+            "ref_id": rid,
+            "research_text": existing_research.get(rid_str),
+            "parsed": None,
+        }
+
+    data = {
+        "_meta": {
+            "description": "Manual research results — fill in research_text for each ref_id, then re-run with --manual",
+            "instructions": "Paste raw BibTeX or plain-text citation info in research_text. Leave as null to skip. Supported fields: title, authors, journal, year, volume, issue, pages, doi, type",
+            "updated_at": datetime.now().isoformat(),
+            "pending_count": len(entries),
+        },
+        "entries": entries,
+    }
+
+    _save_json(data, MANUAL_RESEARCH_JSON)
+    print(f"  Updated → {MANUAL_RESEARCH_JSON}  ({len(entries)} entries)")
+
+
+def _call_manual_parse_llm(ref_id: int, research_text: str) -> dict | None:
+    """
+    Call LLM to parse structured fields from arbitrary research text (BibTeX or plain text).
+    Returns a dict with paper fields or None on failure.
+    """
+    from src.utils.constants import SYSTEM_PROMPT
+
+    prompt = SYSTEM_PROMPT.replace("{refs_text}", f"[{ref_id}] {research_text}")
+    try:
+        result = get_llm_response([{"ref_id": ref_id, "raw_text": research_text}])
+        if isinstance(result, list):
+            result = result[0]
+        if isinstance(result, dict) and result.get("ref_id") is not None:
+            return result
+    except Exception as e:
+        print(f"  [ref #{ref_id}] LLM parse error: {e}")
+    return None
+
+
+def _run_manual_qa(manual_entries: list[dict]) -> list[dict]:
+    """
+    Run LLM QA judgment on manual research entries.
+    Builds synthetic search-result-style entries and calls _call_qa_llm.
+    """
+    raw_map = _load_raw_map()
+
+    synth = []
+    for e in manual_entries:
+        parsed = e.get("parsed") or {}
+        synth.append({
+            "ref_id": e["ref_id"],
+            "crossref": parsed if parsed else None,
+            "semantic_scholar": None,
+            "mcp": None,
+            "strategy_used": "manual_research",
+            "llm_data": parsed,
+            "qa": {},
+        })
+
+    batches = [synth[i:i + QA_BATCH_SIZE]
+               for i in range(0, len(synth), QA_BATCH_SIZE)]
+
+    all_qa = []
+    for batch in batches:
+        qa_batch = _call_qa_llm(batch, raw_map)
+        all_qa.extend(qa_batch)
+
+    qa_map = {int(q["ref_id"]): q for q in all_qa if q.get("ref_id") is not None}
+    for r in synth:
+        rid = int(r["ref_id"])
+        r["qa"] = qa_map.get(rid, {
+            "ref_id": rid, "confidence": "low",
+            "reason": "no QA result", "agreed_fields": [], "disagreed_fields": []
+        })
+
+    # Return (all_qa, synth) — all_qa for qa_map, synth for llm_data
+    return all_qa, synth
+
+
+def run_manual_research():
+    """
+    Parse manual_research.json, run LLM extraction + QA judgment, update qa_review.json.
+    """
+    if not MANUAL_RESEARCH_JSON.exists():
+        _init_manual_research_json()
+        print("\n  Edit data/04_quality/manual_research.json and re-run with --manual")
+        return
+
+    with open(MANUAL_RESEARCH_JSON, encoding="utf-8") as f:
+        research_data = json.load(f)
+
+    to_process = []
+    for rid_str, entry in research_data.get("entries", {}).items():
+        rt = entry.get("research_text")
+        if rt and str(rt).strip() and str(rt).strip().lower() != "null":
+            to_process.append({**entry, "ref_id": int(rid_str)})
+
+    if not to_process:
+        print("  No entries with research_text filled in.")
+        print("  Edit data/04_quality/manual_research.json and re-run.")
+        return
+
+    print(f"  Parsing {len(to_process)} entries via LLM (parallel, max 5 workers)...")
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def _parse_one(entry):
+        parsed = _call_manual_parse_llm(entry["ref_id"], entry["research_text"])
+        return entry["ref_id"], parsed
+
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(_parse_one, e): e for e in to_process}
+        done = 0
+        for future in as_completed(futures):
+            rid, parsed = future.result()
+            for e in to_process:
+                if e["ref_id"] == rid:
+                    e["parsed"] = parsed
+                    break
+            done += 1
+            print(f"    ref #{rid}: {'OK' if parsed else 'FAILED'}")
+
+    print(f"\n  Running QA judgment on {len(to_process)} entries...")
+    qa_raw_results, _synth = _run_manual_qa(to_process)
+    # qa_raw_results: list of raw QA result dicts (ref_id + confidence + reason + agreed/disagreed_fields)
+    # synth_results: list of full synth entries (ref_id + crossref + llm_data + qa subfield)
+    qa_map = {int(q["ref_id"]): q for q in qa_raw_results if q.get("ref_id") is not None}
+
+    # Update manual_research.json with parsed results (keep for audit)
+    for e in to_process:
+        rid_str = str(e["ref_id"])
+        if rid_str in research_data["entries"]:
+            research_data["entries"][rid_str]["parsed"] = e.get("parsed")
+    research_data["_meta"]["updated_at"] = datetime.now().isoformat()
+    _save_json(research_data, MANUAL_RESEARCH_JSON)
+
+    # Merge into qa_review.json (the single source of truth)
+    if not QA_REVIEW.exists():
+        print("  ERROR: qa_review.json not found — run 'python -m src.modules.quality' first.")
+        sys.exit(1)
+    with open(QA_REVIEW, encoding="utf-8") as f:
+        qa_review_data = json.load(f)
+
+    approved_count = 0
+    for e in to_process:
+        rid = e["ref_id"]
+        rid_str = str(rid)
+        parsed = e.get("parsed") or {}
+        qa = qa_map.get(rid, {
+            "confidence": "low",
+            "reason": "no QA result",
+            "agreed_fields": [],
+            "disagreed_fields": [],
+        })
+
+        if rid_str in qa_review_data["entries"]:
+            entry = qa_review_data["entries"][rid_str]
+        else:
+            entry = {
+                "_approved": False,
+                "_reviewed_at": None,
+                "_review_note": None,
+                "_patch": None,
+                "_decision": "pending",
+                "_source": "manual_search",
+                "ref_id": rid,
+            }
+            qa_review_data["entries"][rid_str] = entry
+
+        # Write manual_data and qa into the existing review entry
+        entry["manual_data"] = parsed
+        entry.setdefault("_source", "manual_search")
+        entry.setdefault("_approved", False)
+        entry.setdefault("_decision", "pending")
+        entry.setdefault("qa", {})
+        # Update qa field directly (no separate manual_qa subfield)
+        entry["qa"]["confidence"] = qa.get("confidence", "low")
+        entry["qa"]["reason"] = qa.get("reason", "")
+        entry["qa"]["agreed_fields"] = qa.get("agreed_fields", [])
+        entry["qa"]["disagreed_fields"] = qa.get("disagreed_fields", [])
+
+        # Auto-approve high confidence entries
+        if qa.get("confidence") == "high":
+            entry["_approved"] = True
+            entry["_decision"] = "approved"
+            entry["_reviewed_at"] = datetime.now().isoformat()
+            entry["_review_note"] = "auto-approved (manual search, high confidence)"
+            approved_count += 1
+
+    # Recompute qa_review.json _meta (uses qa.confidence which was synced to manual result)
+    review_entries = qa_review_data["entries"]
+    qa_review_data["_meta"]["total"] = len(review_entries)
+    qa_review_data["_meta"]["medium_count"] = sum(
+        1 for e in review_entries.values() if e.get("qa", {}).get("confidence") == "medium"
+    )
+    qa_review_data["_meta"]["low_count"] = sum(
+        1 for e in review_entries.values() if e.get("qa", {}).get("confidence") == "low"
+    )
+    # reviewed_count = entries with a user decision (approved/sked/sked by user, not auto-approved by --manual)
+    qa_review_data["_meta"]["reviewed_count"] = sum(
+        1 for e in review_entries.values()
+        if e.get("_decision") in ("approved", "skipped", "patched")
+        and e.get("_reviewed_at") is not None
+    )
+    qa_review_data["_meta"]["approved_count"] = sum(
+        1 for e in review_entries.values() if e.get("_approved") is True
+    )
+    qa_review_data["_meta"]["skipped_count"] = sum(
+        1 for e in review_entries.values() if e.get("_decision") == "skipped"
+    )
+
+    _save_json(qa_review_data, QA_REVIEW)
+    print(f"  qa_review.json updated → {QA_REVIEW}")
+
+    # Count from qa_raw_results (authoritative)
+    high_count   = sum(1 for q in qa_raw_results if q.get("confidence") == "high")
+    medium_count = sum(1 for q in qa_raw_results if q.get("confidence") == "medium")
+    low_count    = sum(1 for q in qa_raw_results if q.get("confidence") == "low")
+    pending_review = medium_count + low_count
+
+    print(f"\n  QA done: high={high_count}, medium={medium_count}, low={low_count}")
+    print(f"  Auto-approved (high): {approved_count}")
+
+    # Always rebuild qa_approved.json and bib_export_report.md after --manual
+    # _approved=True entries are included; _approved=False entries are excluded
+    print()
+    print("  Generating qa_approved.json from current qa_review.json...")
+    print()
+    run_approve()
+    _reset_manual_research_json()
+
+
+def _run_manual_review_loop(review_path: Path):
+    """Reusable review loop for any review JSON path."""
+    if not review_path.exists():
+        print(f"ERROR: {review_path} not found.")
+        sys.exit(1)
+
+    with open(review_path, encoding="utf-8") as f:
+        review_data = json.load(f)
+
+    raw_map = _load_raw_map()
+    entries = review_data["entries"]
+    meta = review_data["_meta"]
+
+    pending = sorted(
+        [rid for rid, e in entries.items() if e["_approved"] is False],
+        key=int
+    )
+    already_reviewed = sum(1 for e in entries.values() if e["_approved"] is not False)
+
+    print(f"\n══ Manual Review: {len(pending)} entries to review "
+          f"({already_reviewed} already reviewed) ══")
+    print(f"  medium={meta['medium_count']}  low={meta['low_count']}")
+    print(f"  Saving decisions to: {review_path}")
+    print()
+
+    idx = 0
+    while idx < len(pending):
+        rid = pending[idx]
+        entry = entries[rid]
+        _display_card(rid, entry, idx, len(pending), raw_map, meta)
+        print("> ", end="", flush=True)
+
+        raw = _getch()
+        key = raw.lower()
+
+        def _decide_local(approved: bool):
+            e = review_data["entries"][rid]
+            now = datetime.now().isoformat()
+            e["_approved"] = approved
+            e["_reviewed_at"] = now
+            e["_decision"] = "approved" if approved else "skipped"
+            review_data["_meta"]["reviewed_count"] += 1
+            if approved:
+                review_data["_meta"]["approved_count"] += 1
+            else:
+                review_data["_meta"]["skipped_count"] += 1
+            _save_json(review_data, review_path)
+            return e
+
+        if key in ("\r", "\n", ""):
+            _decide_local(True)
+        elif key == "a":
+            _decide_local(True)
+        elif key == "s":
+            _decide_local(False)
+        elif key == "e":
+            _do_patch(review_data, rid)
+            with open(review_path, encoding="utf-8") as f:
+                review_data = json.load(f)
+            entries = review_data["entries"]
+            pending = sorted([r for r, e in entries.items() if e["_approved"] is False], key=int)
+            continue
+        elif key == "p":
+            try:
+                import fcntl as _fcntl, os as _os2
+                fd = sys.stdin.fileno()
+                fl = _fcntl.fcntl(fd, _fcntl.F_GETFL)
+                _fcntl.fcntl(fd, _fcntl.F_SETFL, fl | _os2.O_NONBLOCK)
+                try:
+                    while True:
+                        sys.stdin.read(1)
+                except Exception:
+                    pass
+                _fcntl.fcntl(fd, _fcntl.F_SETFL, fl)
+            except Exception:
+                pass
+            line = sys.stdin.readline().strip()
+            ids = _parse_approve_range(line, pending)
+            for target_rid in ids:
+                if target_rid in entries and entries[target_rid]["_approved"] is False:
+                    _decide_local(True)
+                    with open(review_path, encoding="utf-8") as f:
+                        review_data = json.load(f)
+                    entries = review_data["entries"]
+            pending = sorted([r for r, e in entries.items() if e["_approved"] is False], key=int)
+            continue
+        elif key == "d":
+            for r in pending[idx:]:
+                if entries[r]["_approved"] is False:
+                    _decide_local(False)
+            break
+        elif key == "q":
+            _save_json(review_data, review_path)
+            print("  Saved progress.")
+            sys.exit(0)
+        else:
+            idx -= 1
+        idx += 1
+
+    with open(review_path, encoding="utf-8") as f:
+        final_data = json.load(f)
+    final_meta = final_data["_meta"]
+    print()
+    print("══ Manual Review complete ══")
+    print(f"  Reviewed:  {final_meta['reviewed_count']}")
+    print(f"  Approved:  {final_meta['approved_count']}")
+    print(f"  Skipped:   {final_meta['skipped_count']}")
+
+    # Always call run_approve() when operating on qa_review.json
+    # Safe to call even if review was partial — it rebuilds qa_approved.json from current _approved state
+    if review_path == QA_REVIEW:
         print()
-        print("  All entries reviewed — generating report now...")
+        print("  Generating qa_approved.json from current qa_review.json...")
         print()
         run_approve()
-    else:
-        print(f"\nRun 'python -m src.modules.quality --approve' to generate qa_approved.json + bib_export_report.md")
+        _reset_manual_research_json()
 
+
+def run_manual_review():
+    """Interactive review for manual_review.json entries."""
+    _run_manual_review_loop(MANUAL_REVIEW_JSON)
+
+
+def run_manual_approve():
+    """Merge approved manual_review.json entries into qa_approved.json."""
+    if not MANUAL_REVIEW_JSON.exists():
+        print(f"ERROR: {MANUAL_REVIEW_JSON} not found — run with --manual first.")
+        sys.exit(1)
+
+    with open(MANUAL_REVIEW_JSON, encoding="utf-8") as f:
+        manual_data = json.load(f)
+
+    existing_approved: list[dict] = []
+    if QA_APPROVED.exists():
+        with open(QA_APPROVED, encoding="utf-8") as f:
+            existing_approved = json.load(f)
+
+    approved_map = {int(e["ref_id"]): e for e in existing_approved}
+
+    for rid_str, entry in manual_data["entries"].items():
+        if entry.get("_approved") is not True:
+            continue
+        rid = int(rid_str)
+        base = {k: v for k, v in entry.items() if not k.startswith("_")}
+        base["_approved_via"] = entry["qa"].get("confidence", "manual")
+        base["_decision"] = "manual"
+        base["_source"] = "manual_review"
+        patch = entry.get("_patch")
+        if patch:
+            base["_patch"] = patch
+        base["_review_note"] = entry.get("_review_note", "")
+        approved_map[rid] = base  # overwrite any previous entry with same ref_id
+
+    result = sorted(approved_map.values(), key=lambda x: int(x["ref_id"]))
+    _save_json(result, QA_APPROVED)
+
+    manual_approved = sum(1 for e in manual_data["entries"].values() if e.get("_approved") is True)
+    print(f"  Merged {manual_approved} manual entries into qa_approved.json")
+    print(f"  qa_approved.json → {QA_APPROVED}  ({len(result)} total entries)")
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -1031,7 +1659,13 @@ def main():
     for _d in [STAGE_RAW, STAGE_SEARCH, STAGE_QUAL, STAGE_EXP]:
         _d.mkdir(parents=True, exist_ok=True)
 
-    if "--approve" in sys.argv:
+    if "--manual-approve" in sys.argv:
+        run_manual_approve()
+    elif "--manual-review" in sys.argv:
+        run_manual_review()
+    elif "--manual" in sys.argv:
+        run_manual_research()
+    elif "--approve" in sys.argv:
         run_approve()
     elif "--review" in sys.argv:
         run_review()

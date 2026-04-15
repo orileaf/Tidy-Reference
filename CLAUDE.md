@@ -89,7 +89,9 @@ data/                           # all generated at runtime; not committed
 │   ├── qa_results.json        # all entries + LLM QA judgment (read-only record)
 │   ├── qa_review.json         # medium+low only; dict keyed by ref_id (interactive review target)
 │   ├── qa_review.json.bak    # auto-backup before overwrite
-│   └── qa_approved.json       # high + approved medium/low (after --approve)
+│   ├── qa_approved.json       # high + approved medium/low (after --approve)
+│   ├── manual_research.json   # manual research input; user fills research_text per ref_id
+│   └── manual_review.json     # parsed + QA'd manual entries (medium+low interactive review)
 ├── 05_export/
 │   ├── references.bib
 │   ├── references_gb.txt
@@ -134,29 +136,53 @@ export.py          →  data/05_export/references.bib
 ```
 python -m src.modules.quality              # run QA judgment (safe to re-run)
 python -m src.modules.quality --review     # interactive review (resumable)
-python -m src.modules.quality --approve    # merge + bib_export_report.md
+python -m src.modules.quality --approve   # merge + report
 ```
 
 **qa_review.json format**: dict keyed by ref_id string. Each entry has `_approved` (null/True/False), `_decision` (pending/approved/skipped/patched), `_patch` ({field: value}) for field overrides, `_review_note`.
 
 **Patch override**: `[E] Patch` overrides any field (title, authors, journal, year, volume, pages, doi, type). Patched entries are auto-approved and win over all other sources in export (MCP > CR > S2 > LLM).
 
+## Manual Research Workflow (for skipped/pending entries)
+
+After interactive review, any skipped/pending entries can be manually researched and re-fed through the pipeline:
+
+```
+python -m src.modules.quality --manual           # init/parse+QA → manual_review.json
+# → edit data/04_quality/manual_research.json: fill in research_text per ref_id
+python -m src.modules.quality --manual           # parse research_text → LLM → QA → manual_review.json
+python -m src.modules.quality --manual-review    # interactive review of medium+low entries
+python -m src.modules.quality --manual-approve   # merge into qa_approved.json
+python -m src.skill export                        # export bibliography
+```
+
+Or via the skill CLI:
+```
+python -m src.skill review --manual
+# fill in research_text
+python -m src.skill review --manual
+python -m src.skill review --manual-review
+python -m src.skill review --manual-approve
+```
+
+**manual_research.json**: dict keyed by ref_id. Each entry has `ref_id`, `research_text` (user fills with BibTeX or plain text), and `parsed` (filled by pipeline). Re-running `--manual` preserves existing `research_text` values.
+
 ## Search Cascade (search.py)
 
-Four steps tried **in order** until data is found:
+Four steps tried **in order** until data is found. Within each step, CR and S2 are fired in parallel (both run, first to respond wins, the other result is discarded):
 
 | Step | Method | Sources |
 |------|--------|---------|
-| 1 | DOI exact lookup | CR + S2 (parallel within step) |
-| 2 | title + journal fuzzy search | CR + S2 (parallel within step) |
+| 1 | DOI exact lookup | CR + S2 (parallel) |
+| 2 | title + journal fuzzy search | CR + S2 (parallel) |
 | 3 | journal + year/vol/pages structured search | CR only |
-| 4 | MCP agent (web search) | MiniMax MCP via `mcp.ClientSession` stdio JSON-RPC; skippable via `--no-mcp` or `DISABLE_MCP=1` |
+| 4 | MCP agent (web search) | MiniMax MCP stdio JSON-RPC; skippable via `--no-mcp` or `DISABLE_MCP=1` |
 
 **Result validation (Steps 2 & 3)**: CR results accepted only if:
 1. Title Jaccard similarity (token-based, stopword-filtered) ≥ 0.30 vs query title
 2. CR journal normalizes to contain (or be contained by) the query journal
 
-Results stored **per-channel** (crossref / semantic_scholar / mcp keys in `search_results.json`), not merged. `strategy_used` records which step succeeded.
+`strategy_used` records which step succeeded. Results stored per-channel in `search_results.json` (crossref / semantic_scholar / mcp keys), not merged at this stage.
 
 ## LLM QA (quality.py)
 
@@ -192,11 +218,82 @@ Use `from src.config import get` and call `get("KEY", default)` — merges `conf
 ## Architecture Notes
 
 - **`final_data` / top-level fallback pattern**: formatters and `bibtex.py` use `entry.get("final_data", entry)` — post-merge fields preferred, graceful fallback to top-level.
-- **`bibtex.py` `_read` function**: standard paper fields read from `final_data` first, then top-level; `api_data`, `disagreements`, `confidence`, and `ref_id` always read from top-level directly.
+- **`bibtex.py` `_read` function**: reads standard paper fields from `final_data` first, falling back to top-level entry; `api_data`, `disagreements`, `confidence`, and `ref_id` are always read directly from top-level entry regardless of `final_data`.
 - **Disagreement nulling**: `_safe_api_data()` in `formatters.py` nulls `api_data` fields that are in `disagreements` before use.
 - **Export field merge priority (MCP > CR > S2 > LLM)**: `_best_field()` in `export.py` picks the first non-null value — not averaged or voted on. Inline in `export.py`; `merger.py` exists but is not in the active pipeline.
 - **Crash-safe stream-save**: `llm_parse.py` and `search.py` write to a temp file every 20 entries. A crash loses at most 19 results. Renamed to final path on success.
-- **`bib_search.py` CR rate-limiting**: shared threading `Semaphore` enforces ~3 Crossref req/s across all workers (`CR_CONCURRENCY=3`, `CR_RATE_SLEEP=0.34s`). Not affected by `WORKERS` in `search.py` or `LLM_MAX_CONCURRENCY` in `llm_parse.py`.
+- **`bib_search.py` CR rate-limiting**: module-level `Semaphore(3)` in `bib_search.py` enforces ~3 Crossref req/s globally across all threads and all workers — independent of `WORKERS` in `search.py`.
 - **`get_llm_response()`**: accepts optional `system=` and `user=` kwargs for custom prompts (bypasses `SYSTEM_PROMPT` template).
 - Reference header patterns detected: `[N]`, `[N].`, `N.`, bare `N ` before a capital letter.
 - `llm_parse.py` validates LLM output: DOI regex, 4-digit year. Falls back to skeleton on failure; failed batches retry single-ref.
+- **Review CLI** (`_print_field_table`): terminal-width-aware wrapping — uses `shutil.get_terminal_size()` to compute column widths dynamically. Long titles/authors wrap at word boundaries instead of overflowing.
+- **MCP Step 4 behavior** (`_mcp_search` in search.py): invokes MiniMax MCP server via `uvx minimax-coding-plan-mcp` stdio JSON-RPC; searches for the paper title, extracts DOI from organic results, then queries Crossref for structured data. Falls back to extracted snippet data if no Crossref DOI match. Requires `pip install mcp` and `MINIMAX_API_KEY` (or `DASHSCOPE_API_KEY` as fallback). arxiv.org is accepted as a source URL; Chinese document-sharing domains are excluded.
+- **`build_final_data()` in export.py**: merges MCP > CR > S2 > LLM per field using `_best_field()`; review `_patch` overrides all sources and the entry is auto-approved.
+
+---
+
+## Behavioral Guidelines
+
+Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-specific instructions as needed.
+
+**Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks, use judgment.
+
+## 1. Think Before Coding
+
+**Don't assume. Don't hide confusion. Surface tradeoffs.**
+
+Before implementing:
+- State your assumptions explicitly. If uncertain, ask.
+- If multiple interpretations exist, present them - don't pick silently.
+- If a simpler approach exists, say so. Push back when warranted.
+- If something is unclear, stop. Name what's confusing. Ask.
+
+## 2. Simplicity First
+
+**Minimum code that solves the problem. Nothing speculative.**
+
+- No features beyond what was asked.
+- No abstractions for single-use code.
+- No "flexibility" or "configurability" that wasn't requested.
+- No error handling for impossible scenarios.
+- If you write 200 lines and it could be 50, rewrite it.
+
+Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, simplify.
+
+## 3. Surgical Changes
+
+**Touch only what you must. Clean up only your own mess.**
+
+When editing existing code:
+- Don't "improve" adjacent code, comments, or formatting.
+- Don't refactor things that aren't broken.
+- Match existing style, even if you'd do it differently.
+- If you notice unrelated dead code, mention it - don't delete it.
+
+When your changes create orphans:
+- Remove imports/variables/functions that YOUR changes made unused.
+- Don't remove pre-existing dead code unless asked.
+
+The test: Every changed line should trace directly to the user's request.
+
+## 4. Goal-Driven Execution
+
+**Define success criteria. Loop until verified.**
+
+Transform tasks into verifiable goals:
+- "Add validation" → "Write tests for invalid inputs, then make them pass"
+- "Fix the bug" → "Write a test that reproduces it, then make it pass"
+- "Refactor X" → "Ensure tests pass before and after"
+
+For multi-step tasks, state a brief plan:
+```
+1. [Step] → verify: [check]
+2. [Step] → verify: [check]
+3. [Step] → verify: [check]
+```
+
+Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
+
+---
+
+**These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
