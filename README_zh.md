@@ -20,11 +20,12 @@
 ## 功能亮点
 
 - **解析**：从 `.docx` / `.txt` 中提取原始引用（支持 `[1]`、`1.`、纯数字编号等多种格式）
-- **LLM 结构化**：将引用文本解析为 title、authors、journal、year、DOI 等字段（支持所有 OpenAI 兼容 API）
+- **LLM 结构化**：将引用文本解析为 title、authors、journal、year、volume、issue、pages、doi、publisher、location、edition 等字段（支持所有 OpenAI 兼容 API）
 - **4 步查证链**：DOI 精确查找 → 标题+期刊模糊匹配 → 期刊+卷期页结构化查找 → MCP 网络搜索兜底
 - **LLM 质量评估**：自动将每条结果分为高/中/低可信度
-- **人工审核**：中低可信度条目由你逐条确认或修正后再导出
+- **人工审核**：中低可信度条目由你逐条确认或修正后再导出；可修正字段包括 title、authors、journal、year、volume、pages、doi、type 及图书专用字段 publisher、location、edition
 - **双格式输出**：BibTeX（`.bib`）+ GB/T 7714-2015 纯文本
+- **按类型检查必填字段**：例如图书检查 edition/publisher/location，期刊文章检查 pages 或 doi
 - **防崩溃**：结果每 20 条即时落盘，中断不会丢失数据
 
 ---
@@ -204,10 +205,10 @@ bash scripts/run_export.sh            # 导出参考文献
 | `data/01_raw/refs_raw.json` | 从文档中提取的原始引用文本 |
 | `data/02_llm/llm_results.json` | LLM 解析出的结构化字段 |
 | `data/03_search/search_results.json` | API 查证结果（按渠道：Crossref、Semantic Scholar、MCP） |
-| `data/04_quality/qa_approved.json` | 已批准、可导出的条目 |
+| `data/04_quality/qa_approved.json` | 已批准、可导出的条目（含图书的 type、publisher、location、edition） |
 | `data/05_export/references.bib` | BibTeX 格式参考文献 |
 | `data/05_export/references_gb.txt` | GB/T 7714-2015 格式参考文献 |
-| `data/05_export/bib_export_report.md` | 每条导出条目的警告提示与备注 |
+| `data/05_export/bib_export_report.md` | 按类型分类的警告：缺失必填字段、类型冲突、MCP URL 检查、作者格式异常 |
 
 ---
 
@@ -223,4 +224,8 @@ bash scripts/run_export.sh            # 导出参考文献
 | `d` | 跳过（不导出此条目） |
 | `q` | 保存并退出 |
 
-修正后的字段优先级最高，会覆盖其他所有数据来源。
+可修正字段（`e`）：title, authors, journal, year, volume, pages, doi, type, **publisher**, **location**, **edition**。
+修正后字段优先级最高，会覆盖其他所有数据来源。
+
+**对于无法查到的条目**（审核时跳过），在 `data/04_quality/manual_research.json` 中填写 `research_text`，然后运行
+`python -m src.skill review --manual` 重新解析并质检。

@@ -95,7 +95,7 @@ QA_LOW_JSON    = DATA / "qa_low.json"
 QA_BATCH_SIZE      = 20
 QA_MAX_CONCURRENCY = 5
 
-VALID_PATCH_FIELDS = {"title", "authors", "journal", "year", "volume", "pages", "doi", "type"}
+VALID_PATCH_FIELDS = {"title", "authors", "journal", "year", "volume", "pages", "doi", "type", "publisher", "location"}
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -179,7 +179,7 @@ def _build_qa_prompt(batch: list, raw_map: dict) -> str:
             if not d:
                 return "无数据"
             parts = []
-            for k in ["title", "authors", "journal", "year", "volume", "issue", "pages", "doi"]:
+            for k in ["title", "authors", "journal", "year", "volume", "issue", "pages", "doi", "publisher", "location"]:
                 v = d.get(k)
                 if v:
                     parts.append(f"{k}={v}")
@@ -425,15 +425,17 @@ def _generate_export_report(
         # Rebuild final_data from entry (simplified — just use agreed fields)
         patch = entry.get("_patch") or {}
         sources = {
+            "manual": entry.get("manual_data"),
             "mcp": entry.get("mcp"),
             "crossref": entry.get("crossref"),
             "semantic_scholar": entry.get("semantic_scholar"),
             "llm": entry.get("llm_data"),
         }
-        PAPER_FIELDS = ["authors", "title", "journal", "year", "volume", "issue", "pages", "doi"]
+        PAPER_FIELDS = ["authors", "title", "journal", "year", "volume", "issue", "pages", "doi", "publisher", "location", "edition"]
         final_data = {}
         for f in PAPER_FIELDS:
-            for tag, src in [("mcp", sources.get("mcp")),
+            for tag, src in [("manual", sources.get("manual")),
+                             ("mcp", sources.get("mcp")),
                              ("crossref", sources.get("crossref")),
                              ("ss", sources.get("semantic_scholar")),
                              ("llm", sources.get("llm"))]:
@@ -569,10 +571,12 @@ def _generate_export_report(
                 ["missing_type", "mcp_incomplete", "mcp_no_url_or_doi",
                  "missing_doi", "missing_title", "missing_journal",
                  "missing_year", "missing_volume", "missing_pages",
+                 "missing_publisher", "missing_location", "missing_edition", "missing_pages_and_doi",
                  "type_mismatch", "mcp_url", "ambiguous_author"].index(x[0])
                 if x[0] in ["missing_type", "mcp_incomplete", "mcp_no_url_or_doi",
                              "missing_doi", "missing_title", "missing_journal",
                              "missing_year", "missing_volume", "missing_pages",
+                             "missing_publisher", "missing_location", "missing_edition", "missing_pages_and_doi",
                              "type_mismatch", "mcp_url", "ambiguous_author"]
                 else 99
             )):
@@ -1012,7 +1016,7 @@ def _print_manual_card(rid, entry, raw_map, meta):
     def _fmt(d: dict) -> str:
         if not d:
             return "—"
-        parts = [f"{k}={d.get(k,'')}" for k in ["title", "authors", "journal", "year", "volume", "pages", "doi"]
+        parts = [f"{k}={d.get(k,'')}" for k in ["title", "authors", "journal", "year", "volume", "pages", "doi", "publisher", "location"]
                  if d.get(k)]
         return ", ".join(parts) or "—"
 

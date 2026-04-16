@@ -5,10 +5,10 @@
 # Full workflow:
 #   ./run_all.sh                  parse → llm → search → QA judgment (pauses)
 #   ./run_review.sh --review      interactive review
-#                                    (auto: --approve + reset manual_research.json when done)
 #   # fill in manual_research.json for skipped entries, then:
-#   ./run_review.sh --manual      parse research_text → LLM → QA → update qa_review.json
-#   ./run_review.sh --review      review remaining medium/low entries
+#   ./run_review.sh --manual       parse research_text → LLM → QA → manual_review.json
+#   ./run_review.sh --manual-review   # review medium/low entries with manual_data
+#   ./run_review.sh --manual-approve  # merge into qa_approved.json
 #   ./run_export.sh              export bibliography
 #
 # Or use the skill CLI directly:

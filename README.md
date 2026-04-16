@@ -20,11 +20,12 @@ If you've ever had a reference list like this:
 ## Features
 
 - **Parses** raw citation text from `.docx` or `.txt` files (handles `[1]`, `1.`, bare-number formats)
-- **Structured extraction** with any OpenAI-compatible LLM API
+- **Structured extraction** with any OpenAI-compatible LLM API — fields include: title, authors, journal, year, volume, issue, pages, doi, publisher, location, edition
 - **4-step search cascade**: DOI lookup → title+journal fuzzy match → structured journal search → MCP web search fallback
 - **LLM quality assessment** classifies each result as high / medium / low confidence
-- **Interactive review** — you approve or patch medium/low entries before export
+- **Interactive review** — you approve or patch medium/low entries before export; patch supports all fields including publisher, location, edition
 - **Dual output**: BibTeX (`.bib`) + GB/T 7714-2015 plain-text bibliography
+- **Type-aware export warnings**: checks required fields per entry type (e.g. edition/publisher/location for books, pages or doi for articles)
 - **Crash-safe**: results saved incrementally, no data loss on interruption
 
 ---
@@ -204,10 +205,10 @@ bash scripts/run_export.sh            # export bibliography
 | `data/01_raw/refs_raw.json` | Raw citation text extracted from your document |
 | `data/02_llm/llm_results.json` | LLM-parsed structured fields (title, authors, journal…) |
 | `data/03_search/search_results.json` | API lookup results by channel (Crossref / Semantic Scholar / MCP) |
-| `data/04_quality/qa_approved.json` | Approved entries ready for export |
+| `data/04_quality/qa_approved.json` | Approved entries ready for export (includes type, publisher, location, edition for books) |
 | `data/05_export/references.bib` | BibTeX bibliography |
 | `data/05_export/references_gb.txt` | GB/T 7714-2015 bibliography |
-| `data/05_export/bib_export_report.md` | Warnings and notes for each exported entry |
+| `data/05_export/bib_export_report.md` | Warnings by entry type: missing required fields, type mismatches, MCP URL checks, ambiguous authors |
 
 ---
 
@@ -223,4 +224,9 @@ During `review --review`:
 | `d` | Skip / don't export this entry |
 | `q` | Save and quit |
 
-Patched fields override all other sources and the entry is auto-approved immediately.
+Patched fields (`e`) override all sources and the entry is auto-approved immediately.
+Patchable fields: title, authors, journal, year, volume, pages, doi, type, **publisher**, **location**, **edition**.
+
+**For entries that could not be resolved** (skipped during review), fill in `research_text` in
+`data/04_quality/manual_research.json`, then run `python -m src.skill review --manual` to re-parse
+and re-QA them.

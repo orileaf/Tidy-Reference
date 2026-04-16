@@ -26,9 +26,9 @@ For each reference, return a JSON array of objects with EXACTLY these keys:
 - type: BibTeX entry type. Infer from the raw text:
     "article"       — journal/magazine articles (has journal name)
     "inproceedings" — conference papers (has "Proc", "Conference", "Symposium" in title or venue)
-    "book"         — whole book, no journal (has publisher but no journal volume/page)
+    "book"          — whole book, no journal (has publisher but no journal volume/page)
     "incollection"  — a chapter/contribution within a book (has "chapter N" or "pp." in a book context)
-    null           — if the type cannot be determined
+    null            — if the type cannot be determined
 - authors: full author string in BibTeX format "Last, First and Last, First" (or null)
 - title: paper/chapter title (or null)
 - journal: full journal name, e.g. "Physical Review Letters" not "Phys. Rev. Lett." (or null)
@@ -37,9 +37,13 @@ For each reference, return a JSON array of objects with EXACTLY these keys:
 - issue: issue number as string (or null) — NEVER guess
 - pages: page range like "123-456" (or null) — NEVER guess
 - doi: DOI string starting with "10." (or null) — NEVER guess
+- publisher: publisher name (or null). For books, extract the publisher field from BibTeX.
+- location: publication location / address (or null). For books, extract the address/location field from BibTeX.
+- edition: edition string (or null), e.g. "2nd", "3rd ed.", "Revised edition". For books, extract from BibTeX.
 - status: "found" if you have high confidence in core fields (title+authors+year), "partial" otherwise
-- field_confidence: object with keys "type", "authors", "title", "journal", "year", "volume", "issue", "pages", "doi";
-  each value is "extracted" (from raw text), "known" (from confident knowledge), or "null" (missing)
+- field_confidence: object with keys "type", "authors", "title", "journal", "year", "volume", "issue", "pages", "doi",
+  "publisher", "location", "edition"; each value is "extracted" (from raw text), "known" (from confident knowledge),
+  or "null" (missing)
 
 Return ONLY valid JSON. No markdown fences. No explanation.
 Only return a JSON array, one object per reference, in the SAME ORDER as provided.
@@ -57,11 +61,15 @@ Example output (no markdown, just JSON):
     "issue": null,
     "pages": "130-141",
     "doi": "10.1175/1520-0469(1963)020<0130:dnf>2.0.co;2",
+    "publisher": null,
+    "location": null,
+    "edition": null,
     "status": "found",
     "field_confidence": {
       "type": "extracted", "authors": "extracted", "title": "extracted",
       "journal": "known", "year": "extracted", "volume": "extracted",
-      "issue": "null", "pages": "extracted", "doi": "extracted"
+      "issue": "null", "pages": "extracted", "doi": "extracted",
+      "publisher": "null", "location": "null", "edition": "null"
     }
   }
 ]

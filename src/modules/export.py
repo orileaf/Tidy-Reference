@@ -33,7 +33,7 @@ APPROVED_JSON = "data/04_quality/qa_approved.json"
 OUT_BIB = "data/05_export/references.bib"
 OUT_GB = "data/05_export/references_gb.txt"
 
-PAPER_FIELDS = ["authors", "title", "journal", "year", "volume", "issue", "pages", "doi"]
+PAPER_FIELDS = ["authors", "title", "journal", "year", "volume", "issue", "pages", "doi", "publisher", "location", "edition"]
 
 
 # ── Field merging ──────────────────────────────────────────────────────────────
@@ -41,13 +41,14 @@ PAPER_FIELDS = ["authors", "title", "journal", "year", "volume", "issue", "pages
 def _best_field(sources: dict, field: str):
     """Return the best available value for a field from sources.
 
-    Priority: MCP > Crossref > Semantic Scholar > LLM-parsed.
+    Priority: manual > Crossref > Semantic Scholar > LLM-parsed > MCP.
     Returns (value, source_tag).
     """
-    for tag, src in [("mcp", sources.get("mcp")),
+    for tag, src in [("manual", sources.get("manual")),
                      ("crossref", sources.get("crossref")),
                      ("semantic_scholar", sources.get("semantic_scholar")),
-                     ("llm", sources.get("llm"))]:
+                     ("llm", sources.get("llm")),
+                     ("mcp", sources.get("mcp"))]:
         v = (src or {}).get(field) if isinstance(src, dict) else None
         if v is not None and str(v).strip():
             return str(v).strip(), tag
@@ -64,6 +65,7 @@ def build_final_data(entry: dict) -> tuple[dict, dict]:
         "crossref": entry.get("crossref"),
         "semantic_scholar": entry.get("semantic_scholar"),
         "llm": entry.get("llm_data"),
+        "manual": entry.get("manual_data"),
     }
 
     final_data = {}
@@ -79,7 +81,7 @@ def build_final_data(entry: dict) -> tuple[dict, dict]:
         final_data[field] = val
         fc_map = {"mcp": "raw", "crossref": "crossref",
                   "semantic_scholar": "semantic_scholar", "llm": "raw",
-                  "patch": "patch", "null": "null"}
+                  "manual": "raw", "patch": "patch", "null": "null"}
         field_confidence[field] = fc_map.get(src, "null")
 
     # type: patch > LLM
@@ -101,8 +103,9 @@ def _check_warnings(entry: dict, final_data: dict) -> list[str]:
     warnings = []
     strategy = entry.get("strategy_used", "")
 
-    # ── Missing fields ──────────────────────────────────────────────────────────
-    if not final_data.get("type"):
+    # ── Missing fields (type-aware) ─────────────────────────────────────────────
+    ref_type = final_data.get("type") or ""
+    if not ref_type:
         warnings.append("missing_type")
     if not final_data.get("title"):
         warnings.append("missing_title")
@@ -112,10 +115,27 @@ def _check_warnings(entry: dict, final_data: dict) -> list[str]:
         warnings.append("missing_year")
     if not final_data.get("volume"):
         warnings.append("missing_volume")
-    if not final_data.get("pages"):
-        warnings.append("missing_pages")
     if not final_data.get("doi"):
         warnings.append("missing_doi")
+
+    # ── Type-specific required fields ───────────────────────────────────────
+    if ref_type == "article" or ref_type == "incollection":
+        if not final_data.get("pages") and not final_data.get("doi"):
+            warnings.append("missing_pages_and_doi")
+        if not final_data.get("pages"):
+            warnings.append("missing_pages")
+    elif ref_type in ("inproceedings", "conference", "proceedings"):
+        if not final_data.get("pages") and not final_data.get("doi"):
+            warnings.append("missing_pages_and_doi")
+        if not final_data.get("publisher"):
+            warnings.append("missing_publisher")
+    elif ref_type == "book":
+        if not final_data.get("publisher"):
+            warnings.append("missing_publisher")
+        if not final_data.get("location"):
+            warnings.append("missing_location")
+        if not final_data.get("edition"):
+            warnings.append("missing_edition")
 
     # ── Type mismatch: LLM says article/book but CR says otherwise ─────────────
     llm_type = (entry.get("llm_data") or {}).get("type", "").lower()
